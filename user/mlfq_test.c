@@ -9,7 +9,7 @@
 struct procinfo info;
 
 // Test tracking
-int test_results[6];  // 0=not run, 1=pass, -1=fail
+int test_results[7];  // 0=not run, 1=pass, -1=fail (7 tests total)
 int num_tests_passed = 0;
 int num_tests_failed = 0;
 
@@ -205,17 +205,21 @@ test_priority_boost(void)
     int saw_demotion = 0;
     int saw_boost = 0;
     
-    // Run long enough to trigger demotion (heavy CPU work with yields)
+    // Run long enough to trigger demotion (heavy CPU work with frequent yields)
     volatile int i, j;
     for(int iter = 0; iter < 10; iter++) {
-      for(i = 0; i < 5000000; i++) {
-        j = i * 2;  // Use j to prevent compiler optimization
-        j = j % 1000;  // More work to ensure we hit quantum
+      // CPU work with intermediate yields to let scheduler check boost timer
+      for(int chunk = 0; chunk < 5; chunk++) {
+        // Very long loop to consume multiple ticks and trigger demotion
+        for(i = 0; i < 10000000; i++) {
+          j = i * 2;
+          j = j % 1000;
+        }
+        (void)j;
+        
+        // Yield frequently to allow scheduler to check boost timer
+        pause(1);
       }
-      (void)j;  // Explicitly use j to avoid unused warning
-      
-      // Yield to scheduler - allows boost check to happen
-      pause(1);
       
       getprocinfo(&info);
       if(info.queue_level > prev_level) {  // Only count increases
@@ -228,20 +232,34 @@ test_priority_boost(void)
     
     print_process_info("After CPU work");
     
-    // At this point, should be demoted
+    // At this point, should be demoted to Q2 or Q3
     // After system runs for 100 ticks, should boost back
     printf("Waiting for boost (takes ~100 ticks)...\n");
     
     int initial_queue = info.queue_level;
     
-    for(int iter = 0; iter < 20; iter++) {
+    // Continue doing CPU work with yields to accumulate ticks
+    // This ensures enough time passes for the 100-tick boost to fire
+    for(int iter = 0; iter < 50; iter++) {
+      // Do some CPU work
+      volatile int i, j;
+      for(i = 0; i < 2000000; i++) {
+        j = i * 2;
+        j = j % 1000;
+      }
+      (void)j;
+      
+      // Yield to let scheduler check boost timer
       pause(1);
+      
       getprocinfo(&info);
-      if(iter % 5 == 0) {
-        printf("  Still waiting... queue=%d\n", info.queue_level);
+      if(iter % 10 == 0) {
+        printf("  Wait iter %d: queue=%d\n", iter, info.queue_level);
       }
       if(info.queue_level < initial_queue) {
         saw_boost = 1;
+        printf("  BOOST DETECTED at iter %d: queue went from %d to %d!\n", 
+               iter, initial_queue, info.queue_level);
       }
     }
     
@@ -367,6 +385,90 @@ test_system_boost(void)
   }
 }
 
+void
+test_starvation_prevention(void)
+{
+  printf("\n=== Test 7: Starvation Prevention (Automatic Boost) ===\n");
+  printf("Long CPU process should be boosted automatically every 100 ticks\n");
+  
+  int pid = fork();
+  if(pid == 0) {
+    // Child: Long-running CPU process
+    printf("Child %d: Starting very long CPU work\n", getpid());
+    print_process_info("Initial");
+    
+    int start_queue = info.queue_level;
+    int boost_count = 0;
+    int last_queue = start_queue;
+    int max_queue_reached = start_queue;
+    
+    // Run for multiple boost intervals with frequent yields
+    // Each burst is split into chunks to yield frequently
+    for(int burst = 0; burst < 20; burst++) {
+      // Heavy CPU work split into chunks with yields
+      volatile int i, j;
+      for(int chunk = 0; chunk < 3; chunk++) {
+        // Very long loop to ensure we consume quantum and get demoted
+        for(i = 0; i < 10000000; i++) {
+          j = i * 2;
+          j = j % 1000;
+        }
+        (void)j;
+        
+        // Yield frequently - allows scheduler to check boost timer every 30 ticks
+        pause(1);
+      }
+      
+      getprocinfo(&info);
+      
+      // Track maximum queue reached (lowest priority)
+      if(info.queue_level > max_queue_reached) {
+        max_queue_reached = info.queue_level;
+      }
+      
+      // Check if queue level improved from previous (boost happened)
+      // Boost moves process to LOWER queue number (higher priority)
+      if(info.queue_level < last_queue) {
+        printf("  Burst %d: BOOSTED! queue went from %d to %d\n", burst, last_queue, info.queue_level);
+        boost_count++;
+      }
+      
+      // Track demotions (queue level increased)
+      if(info.queue_level > last_queue) {
+        printf("  Burst %d: Demoted to queue %d\n", burst, info.queue_level);
+      }
+      
+      last_queue = info.queue_level;
+    }
+    
+    printf("Total automatic boosts observed: %d\n", boost_count);
+    print_process_info("Final");
+    
+    // Pass if we saw at least 1 automatic boost
+    if(boost_count >= 1) {
+      printf("PASS: Automatic boost observed (starvation prevented)\n");
+      exit(1);
+    } else {
+      printf("FAIL: No automatic boost detected\n");
+      exit(0);
+    }
+  } else {
+    // Parent waits
+    int status;
+    wait(&status);
+    
+    if(status == 1) {
+      printf("✓ TEST 7 PASSED: Starvation prevention confirmed\n");
+      test_results[6] = 1;  // Note: test_results needs to be larger
+      num_tests_passed++;
+    } else {
+      printf("✗ TEST 7 FAILED: Starvation prevention not working\n");
+      test_results[6] = -1;
+      num_tests_failed++;
+    }
+  }
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -382,6 +484,7 @@ main(int argc, char *argv[])
     printf("  4: Priority boost test\n");
     printf("  5: Manual priority boost test\n");
     printf("  6: System-wide boost test\n");
+    printf("  7: Starvation prevention test\n");
     printf("  all: Run all tests\n");
     exit(1);
   }
@@ -412,6 +515,10 @@ main(int argc, char *argv[])
     test_system_boost();
   }
   
+  if(test == 7 || argv[1][0] == 'a') {
+    test_starvation_prevention();
+  }
+  
   // Print test summary
   printf("\n========================================\n");
   printf("TEST SUMMARY\n");
@@ -427,6 +534,7 @@ main(int argc, char *argv[])
     if(test_results[3] == 1) printf("  Test 4: Priority Boost\n");
     if(test_results[4] == 1) printf("  Test 5: Manual Boost\n");
     if(test_results[5] == 1) printf("  Test 6: System Boost\n");
+    if(test_results[6] == 1) printf("  Test 7: Starvation Prevention\n");
   }
   
   if(num_tests_failed > 0) {
@@ -437,6 +545,7 @@ main(int argc, char *argv[])
     if(test_results[3] == -1) printf("  Test 4: Priority Boost\n");
     if(test_results[4] == -1) printf("  Test 5: Manual Boost\n");
     if(test_results[5] == -1) printf("  Test 6: System Boost\n");
+    if(test_results[6] == -1) printf("  Test 7: Starvation Prevention\n");
   }
   
   if(num_tests_failed == 0 && num_tests_passed > 0) {
