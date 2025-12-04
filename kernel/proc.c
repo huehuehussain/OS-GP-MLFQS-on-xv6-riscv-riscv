@@ -26,6 +26,11 @@ struct runqueue {
 uint ticks_since_boost = 0;
 struct spinlock mlfq_lock;       // Lock for MLFQ operations
 
+// Week 3: MLFQ Statistics for performance analysis
+struct mlfq_stats scheduler_stats = {0};
+struct spinlock stats_lock;
+uint64 scheduler_cycle_count = 0;
+
 extern void forkret(void);
 static void freeproc(struct proc *p);
 
@@ -134,6 +139,11 @@ demote_process(struct proc *p)
     p->queue_level++;
     p->time_in_queue = 0;
     
+    // Week 3: Track demotion statistics
+    acquire(&stats_lock);
+    scheduler_stats.total_demotions++;
+    release(&stats_lock);
+    
     // Re-enqueue at new level
     enqueue(p);
   }
@@ -192,6 +202,9 @@ procinit(void)
   
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+  initlock(&mlfq_lock, "mlfq");           // Initialize MLFQ lock
+  initlock(&stats_lock, "stats");         // Week 3: Initialize stats lock
+  
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
       p->state = UNUSED;
@@ -598,9 +611,18 @@ scheduler(void)
     intr_on();
     intr_off();
 
+    // Week 3: Update scheduler cycle count
+    acquire(&stats_lock);
+    scheduler_stats.total_schedules++;
+    scheduler_cycle_count++;
+    release(&stats_lock);
+
     // Check if priority boost is needed
     if(ticks_since_boost >= BOOST_INTERVAL) {
       priority_boost();
+      acquire(&stats_lock);
+      scheduler_stats.total_boosts++;
+      release(&stats_lock);
     }
 
     int found = 0;
@@ -610,6 +632,11 @@ scheduler(void)
       while((p = dequeue(level)) != 0) {
         acquire(&p->lock);
         if(p->state == RUNNABLE) {
+          // Week 3: Track level statistics
+          acquire(&stats_lock);
+          scheduler_stats.level_schedules[level]++;
+          release(&stats_lock);
+          
           // Switch to chosen process.  It is the process's job
           // to release its lock and then reacquire it
           // before jumping back to us.

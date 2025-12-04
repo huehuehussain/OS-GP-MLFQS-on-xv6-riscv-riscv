@@ -89,6 +89,15 @@ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 #define QUANTUM_L3 16              // Time quantum for level 3 (16 ticks)
 #define BOOST_INTERVAL 100         // Priority boost every 100 ticks
 
+// MLFQ Statistics Structure for Week 3
+struct mlfq_stats {
+  uint64 total_schedules;        // Total times scheduler ran
+  uint64 total_boosts;           // Total priority boosts
+  uint64 total_demotions;        // Total process demotions
+  uint64 level_queue_count[MLFQ_LEVELS];  // Processes in each queue
+  uint64 level_schedules[MLFQ_LEVELS];    // Times each level executed
+};
+
 // Structure for communicating process info to user-space
 struct procinfo {
   int pid;

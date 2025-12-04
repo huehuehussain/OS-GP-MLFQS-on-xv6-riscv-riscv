@@ -145,6 +145,8 @@ UPROGS=\
 	$U/_dorphan\
 	$U/_test_getprocinfo\
 	$U/_scheduler_demo\
+	$U/_mlfq_test\
+	$U/_mlfq_stats\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

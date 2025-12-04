@@ -43,4 +43,6 @@ entry("sbrk");
 entry("pause");
 entry("uptime");
 entry("getprocinfo");
+entry("boostproc");  # Week 3: Manual priority boost
+entry("getschedulerstats");  # Week 3: Get scheduler statistics
 

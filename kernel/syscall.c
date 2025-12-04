@@ -102,6 +102,8 @@ extern uint64 sys_link(void);
 extern uint64 sys_mkdir(void);
 extern uint64 sys_close(void);
 extern uint64 sys_getprocinfo(void);
+extern uint64 sys_boostproc(void);  // Week 3: Manual priority boost
+extern uint64 sys_getschedulerstats(void);  // Week 3: Retrieve scheduler statistics
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -128,6 +130,9 @@ static uint64 (*syscalls[])(void) = {
 [SYS_mkdir]   sys_mkdir,
 [SYS_close]   sys_close,
 [SYS_getprocinfo] sys_getprocinfo,
+[SYS_boostproc] sys_boostproc,  // Week 3
+[SYS_getschedulerstats] sys_getschedulerstats,  // Week 3
+
 };
 
 void

@@ -133,3 +133,54 @@ sys_getprocinfo(void)
   return 0;
 }
 
+// Week 3: Manual priority boost syscall for testing
+uint64
+sys_boostproc(void)
+{
+  int pid;
+  struct proc *p;
+  
+  argint(0, &pid);
+  
+  // If pid is 0, boost all processes
+  // Otherwise, boost the process with given pid
+  if(pid == 0) {
+    // Boost all processes to level 0
+    priority_boost();
+    return 0;
+  } else {
+    // Boost specific process
+    for(p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if(p->pid == pid) {
+        // Set to highest priority
+        p->queue_level = 0;
+        p->time_in_queue = 0;
+        release(&p->lock);
+        return 0;
+      }
+      release(&p->lock);
+    }
+    return -1;  // Process not found
+  }
+}
+
+uint64
+sys_getschedulerstats(void)
+{
+  uint64 stats_ptr;
+  argaddr(0, &stats_ptr);
+  struct mlfq_stats stats;
+  
+  // Acquire lock and copy statistics
+  acquire(&stats_lock);
+  stats = scheduler_stats;
+  release(&stats_lock);
+  
+  // Copy to user space
+  if(copyout(myproc()->pagetable, stats_ptr, (char *)&stats, sizeof(stats)) < 0)
+    return -1;
+  
+  return 0;
+}
+

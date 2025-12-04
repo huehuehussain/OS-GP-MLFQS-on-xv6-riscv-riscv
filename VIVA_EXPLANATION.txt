@@ -1578,6 +1578,162 @@ A: No - all are positive (2,4,8,16). Even infinite loop at level 3 gets 16 ticks
 
 ---
 
-**End of Complete Viva Explanation Document - Week 1 + Week 2**
+## Week 3 Additions: Testing & Statistics ✨ NEW
 
-Updated: Week 2 Implementation Complete ✅
+### boostproc() Syscall (Week 3)
+
+**Q: What does boostproc() do?**
+A: Manual priority boost syscall. boostproc(0) boosts all processes to level 0. boostproc(pid) boosts specific process.
+
+**Q: How is boostproc() different from automatic priority boost?**
+A: Automatic boost happens every 100 ticks on all processes. Manual boost can happen anytime on specific or all processes on demand.
+
+**Q: When would you use boostproc() instead of letting boost timer work?**
+A: For testing specific scenarios - e.g., testing if starvation prevention works, or manually verifying behavior without waiting 100 ticks.
+
+**Q: What's SYS_boostproc number?**
+A: 23 (in kernel/syscall.h). Registered in dispatcher as [SYS_boostproc] sys_boostproc.
+
+**Q: Is boostproc() thread-safe?**
+A: Yes - acquires process lock before modifying queue_level and time_in_queue.
+
+**Q: What if boostproc(pid) called with invalid pid?**
+A: Returns -1 (process not found). Doesn't crash or corrupt scheduler state.
+
+**Q: Why does boostproc(0) call priority_boost()?**
+A: priority_boost() already implements the logic to boost all processes. Reuses existing tested code.
+
+### get_scheduler_stats() Syscall (Week 3 - Statistics Monitoring) ✨ NEW
+
+**Q: What does get_scheduler_stats() do?**
+A: Retrieves real-time scheduler statistics from kernel to user-space. Returns counts: schedules, boosts, demotions, queue distribution, per-queue metrics.
+
+**Q: How is get_scheduler_stats() different from getprocinfo()?**
+A: getprocinfo() gets info about ONE process. get_scheduler_stats() gets global scheduler metrics (system-wide statistics).
+
+**Q: What's SYS_getschedulerstats number?**
+A: 24 (in kernel/syscall.h). Registered in dispatcher as [SYS_getschedulerstats] sys_getschedulerstats.
+
+**Q: What does struct mlfq_stats contain?**
+A: 
+```c
+struct mlfq_stats {
+  uint64 total_schedules;      // Total scheduler cycles
+  uint64 total_boosts;         // Total priority boosts
+  uint64 total_demotions;      // Total demotions
+  uint64 level_queue_count[4]; // Processes in each queue
+  uint64 level_schedules[4];   // Schedules per queue
+};
+```
+
+**Q: How does get_scheduler_stats() retrieve kernel data?**
+A: 
+1. User calls getschedulerstats(&stats)
+2. Syscall handler sys_getschedulerstats() called
+3. Handler acquires stats_lock (thread-safe)
+4. Copies scheduler_stats structure
+5. Uses copyout() to transfer to user-space
+6. Returns 0 success or -1 failure
+
+**Q: Why use copyout()?**
+A: Kernel and user-space have separate page tables. copyout() safely validates and copies data from kernel memory to user-space address.
+
+**Q: What's stats_lock and why is it needed?**
+A: Spinlock protecting scheduler_stats. Prevents race conditions when stats updated (from scheduler) while being read (get_scheduler_stats).
+
+**Q: How is scheduler_stats updated?**
+A: Three collection points:
+1. In scheduler() - increment total_schedules, update level_schedules[level]
+2. In priority_boost() - increment total_boosts
+3. In demote_process() - increment total_demotions
+
+**Q: Is get_scheduler_stats() thread-safe?**
+A: Yes - acquires stats_lock before copying. Guarantees consistent snapshot of statistics.
+
+**Q: How do you use get_scheduler_stats() in user program?**
+A:
+```c
+struct mlfq_stats stats;
+if(getschedulerstats(&stats) < 0) {
+  printf("Error\n");
+  exit(1);
+}
+printf("Total schedules: %ld\n", stats.total_schedules);
+```
+
+**Q: What does mlfq_stats program do?**
+A: User-space tool that calls getschedulerstats() syscall and displays real kernel statistics (not simulated). Shows CPU-bound demotion, I/O fairness, starvation prevention.
+
+**Q: What's the difference between mlfq_test and mlfq_stats?**
+A: mlfq_test - real-time test execution (shows individual process behavior during test). mlfq_stats - queries kernel at specific time (shows aggregate statistics).
+
+**Q: How do you interpret high total_demotions?**
+A: Indicates many CPU-bound processes using full quantum. Scheduler working correctly with exponential degradation.
+
+**Q: How do you interpret high total_boosts?**
+A: Indicates scheduler running for long time. Each ~100 ticks gives one boost. Many boosts = system has run long.
+
+**Q: How do you interpret level_schedules[0] >> level_schedules[3]?**
+A: Indicates mostly I/O-bound workload - high priority queue getting far more execution. Fair scheduling if this expected.
+
+**Q: How do you interpret level_schedules evenly distributed?**
+A: Indicates well-balanced workload with proper demotion/boost policy working. Scheduler is fair across all priority levels.
+
+**Q: What if level_queue_count shows all processes in queue 3?**
+A: Expected behavior if system running long time - CPU-bound processes demote to lowest queue. I/O-bound would be at higher queues.
+
+**Q: Can statistics overflow?**
+A: Yes - uint64 can overflow after ~584 billion ticks (~10 million seconds). But this is normal behavior, not critical for testing.
+
+**Q: When would you use get_scheduler_stats()?**
+A: Post-test analysis - collect statistics, stop test, examine what happened. Real data proves scheduler working correctly.
+
+**Q: Can you call get_scheduler_stats() during test execution?**
+A: Yes - syscall is always available. But best to query after test completes for cleaner analysis.
+
+**Q: What if getschedulerstats() returns -1?**
+A: Copy failure (rare). Usually indicates invalid pointer. Check that &stats points to valid user-space memory.
+
+### Testing Infrastructure (Week 3)
+
+**Q: What are the 6 tests in mlfq_test?**
+A:
+1. CPU demotion - verify CPU-bound process demotes Q0→Q1→Q2→Q3
+2. I/O fairness - verify I/O-bound process stays at Q0
+3. Mixed workload - verify both types run fairly together
+4. Priority boost - verify automatic boost every ~100 ticks
+5. Manual boost - verify boostproc(pid) on specific process
+6. System boost - verify boostproc(0) on all processes
+
+**Q: How does test 1 verify demotion?**
+A: Forks child, child does CPU work, parent monitors getprocinfo() in loop, prints queue level after each iteration, verifies 0→1→2→3 progression.
+
+**Q: How does test 2 verify I/O fairness?**
+A: Forks child that does CPU work then sleeps. Parent monitors queue level. Verifies process stays at Q0 (no demotion) while I/O-bound.
+
+**Q: How does test 3 verify mixed workload?**
+A: Forks two children - one CPU-bound, one I/O-bound. Both run simultaneously. Verifies CPU demotes while I/O stays high priority.
+
+**Q: How does test 4 verify automatic boost?**
+A: Forks CPU-bound child, waits ~100 ticks, verifies child returns to Q0 (boost happened).
+
+**Q: How does test 5 verify manual boost?**
+A: Forks child demoted to Q3, calls boostproc(child_pid), verifies child back at Q0.
+
+**Q: How does test 6 verify system boost?**
+A: Creates multiple processes, calls boostproc(0), verifies all have queue_level=0.
+
+**Q: Why are tests important?**
+A: Prove scheduler implements MLFQ correctly. Real execution shows CPU-bound demotion, I/O fairness, starvation prevention actually working.
+
+**Q: How do you run all tests?**
+A: mlfq_test all - runs all 6 tests sequentially, prints results for each.
+
+**Q: How do you run single test?**
+A: mlfq_test 1 (or 2, 3, etc.) - runs just that test.
+
+---
+
+**End of Complete Viva Explanation Document - Week 1 + Week 2 + Week 3 ✅**
+
+Updated: Week 3 Implementation Complete with get_scheduler_stats() Syscall ✅

@@ -2,7 +2,7 @@
 
 struct stat;
 
-// MLFQ Scheduler structure (same as kernel)
+// MLFQ Scheduler structures
 struct procinfo {
   int pid;
   int state;
@@ -10,6 +10,14 @@ struct procinfo {
   int time_in_queue;
   uint64 time_slices;
   char name[16];
+};
+
+struct mlfq_stats {
+  uint64 total_schedules;
+  uint64 total_boosts;
+  uint64 total_demotions;
+  uint64 level_queue_count[4];
+  uint64 level_schedules[4];
 };
 
 // system calls
@@ -35,6 +43,8 @@ char* sys_sbrk(int,int);
 int pause(int);
 int uptime(void);
 int getprocinfo(struct procinfo*);
+int boostproc(int);  // Week 3: Manual priority boost
+int getschedulerstats(struct mlfq_stats*);  // Week 3: Get scheduler statistics
 
 // ulib.c
 int stat(const char*, struct stat*);

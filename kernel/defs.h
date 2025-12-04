@@ -108,6 +108,9 @@ struct proc*    dequeue(int);
 void            dequeue_specific(struct proc*);
 void            demote_process(struct proc*);
 void            priority_boost(void);
+// Week 3: Statistics and analysis
+extern struct mlfq_stats scheduler_stats;
+uint64          get_scheduler_stats(uint64);
 
 // swtch.S
 void            swtch(struct context*, struct context*);
