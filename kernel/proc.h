@@ -128,4 +128,5 @@ struct proc {
   int time_in_queue;           // Ticks spent in current queue
   uint64 time_slices;          // Total CPU time slices received
   int entered_queue_tick;      // Tick when process entered current queue
+  struct proc *queue_next;     // Next process in queue (for queue management)
 };

@@ -101,6 +101,13 @@ void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
+// MLFQ queue management
+int             get_quantum(int);
+void            enqueue(struct proc*);
+struct proc*    dequeue(int);
+void            dequeue_specific(struct proc*);
+void            demote_process(struct proc*);
+void            priority_boost(void);
 
 // swtch.S
 void            swtch(struct context*, struct context*);

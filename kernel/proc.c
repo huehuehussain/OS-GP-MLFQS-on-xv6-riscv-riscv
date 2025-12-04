@@ -15,6 +15,17 @@ struct proc *initproc;
 int nextpid = 1;
 struct spinlock pid_lock;
 
+// MLFQ Queue structures
+// Each queue maintains a linked list of processes at that priority level
+struct runqueue {
+  struct proc *head;            // First process in queue
+  struct proc *tail;            // Last process in queue
+} runqueues[MLFQ_LEVELS];        // Array of queues, one per priority level
+
+// Global tick counter for priority boosting
+uint ticks_since_boost = 0;
+struct spinlock mlfq_lock;       // Lock for MLFQ operations
+
 extern void forkret(void);
 static void freeproc(struct proc *p);
 
@@ -25,6 +36,136 @@ extern char trampoline[]; // trampoline.S
 // memory model when using p->parent.
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
+
+// ============================================================
+// MLFQ Queue Management Functions
+// ============================================================
+
+// Get the time quantum for a given queue level
+int
+get_quantum(int level)
+{
+  switch(level) {
+    case 0: return QUANTUM_L0;
+    case 1: return QUANTUM_L1;
+    case 2: return QUANTUM_L2;
+    case 3: return QUANTUM_L3;
+    default: return QUANTUM_L3;
+  }
+}
+
+// Add a process to the tail of its queue
+// Called when process becomes RUNNABLE or needs to be re-queued
+void
+enqueue(struct proc *p)
+{
+  int level = p->queue_level;
+  
+  // Add to tail of queue
+  if(runqueues[level].tail == 0) {
+    // Queue is empty
+    runqueues[level].head = p;
+    runqueues[level].tail = p;
+    p->queue_next = 0;
+  } else {
+    // Add to end
+    runqueues[level].tail->queue_next = p;
+    runqueues[level].tail = p;
+    p->queue_next = 0;
+  }
+}
+
+// Remove a process from the front of its queue
+// Called by scheduler when selecting next process
+struct proc*
+dequeue(int level)
+{
+  struct proc *p = runqueues[level].head;
+  
+  if(p != 0) {
+    runqueues[level].head = p->queue_next;
+    if(runqueues[level].head == 0) {
+      runqueues[level].tail = 0;
+    }
+    p->queue_next = 0;
+  }
+  
+  return p;
+}
+
+// Remove a specific process from a queue
+// Called when process is selected to run
+void
+dequeue_specific(struct proc *p)
+{
+  int level = p->queue_level;
+  struct proc *curr, *prev;
+  
+  prev = 0;
+  for(curr = runqueues[level].head; curr != 0; prev = curr, curr = curr->queue_next) {
+    if(curr == p) {
+      if(prev == 0) {
+        // Removing head
+        runqueues[level].head = p->queue_next;
+      } else {
+        // Removing middle or tail
+        prev->queue_next = p->queue_next;
+      }
+      if(p->queue_next == 0) {
+        // Was tail
+        runqueues[level].tail = prev;
+      }
+      p->queue_next = 0;
+      return;
+    }
+  }
+}
+
+// Demote a process to the next lower priority queue
+// Called when process uses its full time quantum
+void
+demote_process(struct proc *p)
+{
+  if(p->queue_level < MLFQ_LEVELS - 1) {
+    // Remove from current queue
+    dequeue_specific(p);
+    
+    // Move to next level
+    p->queue_level++;
+    p->time_in_queue = 0;
+    
+    // Re-enqueue at new level
+    enqueue(p);
+  }
+}
+
+// Move all processes back to the highest priority queue
+// Called every BOOST_INTERVAL ticks for starvation prevention
+void
+priority_boost(void)
+{
+  struct proc *p;
+  int i;
+  
+  // Clear all queues temporarily
+  for(i = 0; i < MLFQ_LEVELS; i++) {
+    runqueues[i].head = 0;
+    runqueues[i].tail = 0;
+  }
+  
+  // Move all runnable processes back to level 0
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state == RUNNABLE) {
+      p->queue_level = 0;
+      p->time_in_queue = 0;
+      enqueue(p);
+    }
+    release(&p->lock);
+  }
+  
+  ticks_since_boost = 0;
+}
 
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
@@ -156,6 +297,7 @@ found:
   p->time_in_queue = 0;        // Reset time in current queue
   p->time_slices = 0;          // Reset total time slices
   p->entered_queue_tick = 0;   // Will be set when first scheduled
+  p->queue_next = 0;           // Not in any queue yet
 
   return p;
 }
@@ -185,6 +327,7 @@ freeproc(struct proc *p)
   p->time_in_queue = 0;
   p->time_slices = 0;
   p->entered_queue_tick = 0;
+  p->queue_next = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -316,6 +459,7 @@ kfork(void)
 
   acquire(&np->lock);
   np->state = RUNNABLE;
+  enqueue(np);  // Add to queue level 0 (highest priority)
   release(&np->lock);
 
   return pid;
@@ -442,6 +586,7 @@ scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
+  int level;
 
   c->proc = 0;
   for(;;){
@@ -453,24 +598,46 @@ scheduler(void)
     intr_on();
     intr_off();
 
-    int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
-      }
-      release(&p->lock);
+    // Check if priority boost is needed
+    if(ticks_since_boost >= BOOST_INTERVAL) {
+      priority_boost();
     }
+
+    int found = 0;
+    
+    // Iterate through priority queues from highest (0) to lowest (3)
+    for(level = 0; level < MLFQ_LEVELS; level++) {
+      while((p = dequeue(level)) != 0) {
+        acquire(&p->lock);
+        if(p->state == RUNNABLE) {
+          // Switch to chosen process.  It is the process's job
+          // to release its lock and then reacquire it
+          // before jumping back to us.
+          p->state = RUNNING;
+          c->proc = p;
+          p->entered_queue_tick = ticks_since_boost;
+          swtch(&c->context, &p->context);
+
+          // Process is done running for now.
+          // It should have changed its p->state before coming back.
+          c->proc = 0;
+          found = 1;
+          
+          // Re-enqueue if still runnable
+          if(p->state == RUNNABLE) {
+            enqueue(p);
+          }
+        } else if(p->state == SLEEPING) {
+          // Process is sleeping, don't re-enqueue
+        } else if(p->state == ZOMBIE) {
+          // Process is zombie, don't re-enqueue
+        }
+        release(&p->lock);
+        break; // Process one per level per iteration
+      }
+      if(found) break; // Found a process, restart from highest priority
+    }
+    
     if(found == 0) {
       // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
@@ -596,6 +763,7 @@ wakeup(void *chan)
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
         p->state = RUNNABLE;
+        enqueue(p);  // Add to appropriate queue
       }
       release(&p->lock);
     }

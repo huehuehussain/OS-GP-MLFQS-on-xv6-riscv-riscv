@@ -10,6 +10,7 @@ struct spinlock tickslock;
 uint ticks;
 
 extern char trampoline[], uservec[];
+extern uint ticks_since_boost;
 
 // in kernelvec.S, calls kerneltrap().
 void kernelvec();
@@ -167,8 +168,32 @@ clockintr()
   if(cpuid() == 0){
     acquire(&tickslock);
     ticks++;
+    ticks_since_boost++;
     wakeup(&ticks);
     release(&tickslock);
+  }
+
+  // Handle MLFQ time quantum for current process
+  struct proc *p = myproc();
+  if(p != 0 && p->state == RUNNING) {
+    // Increment time in current queue
+    p->time_in_queue++;
+    
+    // Get quantum for current level
+    int quantum = get_quantum(p->queue_level);
+    
+    // If time quantum exceeded, demote and yield
+    if(p->time_in_queue >= quantum) {
+      p->time_in_queue = 0;  // Reset for next level
+      
+      // Demote to next level if not already at lowest
+      if(p->queue_level < MLFQ_LEVELS - 1) {
+        p->queue_level++;
+      }
+      
+      // Yield to scheduler
+      yield();
+    }
   }
 
   // ask for the next timer interrupt. this also clears
