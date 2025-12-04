@@ -1,0 +1,1027 @@
+# MLFQ Scheduler Week 1 Implementation - Complete Viva Explanation
+
+## Table of Contents
+1. [Project Overview](#project-overview)
+2. [Week 1 Objectives](#week-1-objectives)
+3. [System Architecture](#system-architecture)
+4. [Code Implementation Details](#code-implementation-details)
+5. [Testing and Verification](#testing-and-verification)
+6. [Key Design Decisions](#key-design-decisions)
+
+---
+
+## Project Overview
+
+### What is MLFQ?
+The Multi-Level Feedback Queue (MLFQ) scheduler is a dynamic scheduling algorithm that:
+- Uses multiple priority queues to manage processes
+- Automatically adjusts process priorities based on behavior
+- Prevents starvation through priority boosting
+- Balances responsiveness (I/O-bound) with fairness (CPU-bound)
+
+### Why MLFQ?
+The default xv6 scheduler uses simple round-robin, treating all processes equally. MLFQ provides:
+- **Better interactivity**: I/O-bound processes get higher priority
+- **CPU fairness**: CPU-bound processes still get execution time
+- **System responsiveness**: Quick response to user input
+- **Starvation prevention**: All processes eventually get CPU time
+
+### Our Implementation
+We're implementing MLFQ on xv6-RISC-V with:
+- **4 priority levels** (queues 0-3, where 0 is highest priority)
+- **Exponential time quanta**: 2, 4, 8, 16 ticks
+- **Demotion policy**: Processes move down when they use full quantum
+- **Promotion policy**: I/O processes stay high; CPU boost every 100 ticks
+
+---
+
+## Week 1 Objectives
+
+### What We Did in Week 1:
+1. ✅ Understood the existing xv6 scheduler
+2. ✅ Designed the MLFQ queue structure
+3. ✅ Implemented `getprocinfo()` system call
+4. ✅ Created queue scaffolding (data structure foundation)
+5. ✅ Initialized MLFQ fields in process lifecycle
+6. ✅ Created test programs
+7. ✅ Documented everything comprehensively
+
+### What We're NOT Doing Yet:
+- NOT implementing actual queue arrays (Week 2)
+- NOT modifying scheduler() main loop (Week 2)
+- NOT implementing demotion logic (Week 2)
+- NOT enforcing time quanta (Week 2)
+
+---
+
+## System Architecture
+
+### MLFQ Queue Structure
+
+```
+┌─────────────────────────────────┐
+│ Queue Level 0 (Highest Priority)│  Time Quantum: 2 ticks
+│ Interactive/I/O-bound processes │  Examples: text editors, shells
+└─────────────────────────────────┘
+          ↓ (if uses full quantum)
+
+┌─────────────────────────────────┐
+│ Queue Level 1                   │  Time Quantum: 4 ticks
+│ Mixed workload processes        │  Examples: browsers, IDE
+└─────────────────────────────────┘
+          ↓ (if uses full quantum)
+
+┌─────────────────────────────────┐
+│ Queue Level 2                   │  Time Quantum: 8 ticks
+│ CPU-bound processes             │  Examples: compilers, video encoding
+└─────────────────────────────────┘
+          ↓ (if uses full quantum)
+
+┌─────────────────────────────────┐
+│ Queue Level 3 (Lowest Priority) │  Time Quantum: 16 ticks
+│ Batch/background processes      │  Examples: backups, indexing
+└─────────────────────────────────┘
+          ↓ (every 100 ticks)
+    Priority Boost - All → Level 0
+```
+
+### Process Behavior Patterns
+
+**I/O-Bound Process** (like a text editor):
+- Starts at Level 0
+- Types 1 character → Yields (blocks on I/O)
+- Stays at Level 0 (never uses full quantum)
+- Result: Always responsive
+
+**CPU-Bound Process** (like a compiler):
+- Starts at Level 0
+- Computes for 2 ticks → Uses full quantum → Demoted to Level 1
+- Computes for 4 ticks → Uses full quantum → Demoted to Level 2
+- Pattern: L0 → L1 → L2 → L3 (eventually reaches bottom)
+- Result: Gets CPU time but doesn't starve others
+
+**Mixed Process** (like a web browser):
+- Starts at Level 0
+- Network request → Yields → Stays at L0
+- Process data → Uses 3 ticks → Demoted to L1
+- Wait for click → Yields → Stays at L1
+- Pattern: Oscillates based on behavior
+
+---
+
+## Code Implementation Details
+
+### 1. MLFQ Constants (kernel/proc.h)
+
+```c
+#define MLFQ_LEVELS 4              // Number of priority queues (0=highest, 3=lowest)
+#define QUANTUM_L0 2               // Time quantum for level 0 (2 ticks)
+#define QUANTUM_L1 4               // Time quantum for level 1 (4 ticks)
+#define QUANTUM_L2 8               // Time quantum for level 2 (8 ticks)
+#define QUANTUM_L3 16              // Time quantum for level 3 (16 ticks)
+#define BOOST_INTERVAL 100         // Priority boost every 100 ticks
+```
+
+**Why These Values?**
+- 4 levels: Good balance between complexity and differentiation
+- Exponential quanta (2, 4, 8, 16): Prevents starvation naturally
+- 100-tick boost: Long enough to classify behavior, not too long to starve
+
+---
+
+### 2. Process Information Structure (kernel/proc.h)
+
+```c
+// Structure for communicating process info to user-space
+struct procinfo {
+  int pid;              // Process ID - identifies the process
+  int state;            // Process state (1=USED, 2=SLEEPING, 3=RUNNABLE, 4=RUNNING, 5=ZOMBIE)
+  int queue_level;      // Current queue level (0-3)
+  int time_in_queue;    // Ticks spent in current queue
+  uint64 time_slices;   // Total CPU time slices received
+  char name[16];        // Process name (debugging)
+};
+```
+
+**Purpose**: This structure allows user-space programs to query MLFQ information about themselves via `getprocinfo()` syscall. It's essential for testing and debugging.
+
+**Usage**: When user calls `getprocinfo(&info)`, kernel fills this struct with current process data.
+
+---
+
+### 3. Extended struct proc (kernel/proc.h)
+
+```c
+struct proc {
+  // [... existing fields ...]
+  
+  // MLFQ scheduling fields
+  int queue_level;             // Current queue level (0=highest priority)
+  int time_in_queue;           // Ticks spent in current queue
+  uint64 time_slices;          // Total CPU time slices received
+  int entered_queue_tick;      // Tick when process entered current queue
+};
+```
+
+**Explanation of Each Field**:
+
+1. **`queue_level`**: Which queue (0-3) is this process in?
+   - 0 = highest priority (interactive)
+   - 3 = lowest priority (batch)
+   - Week 2: Scheduler uses this to decide which queue to check first
+
+2. **`time_in_queue`**: How many ticks has this process been in current queue?
+   - Reset to 0 when demoted/promoted
+   - Week 2: Scheduler increments this; demotion happens when reaches quantum
+
+3. **`time_slices`**: Total CPU time this process received (in ticks)
+   - Only increments, never resets
+   - Used for metrics and debugging
+   - Tells us total lifetime execution
+
+4. **`entered_queue_tick`**: When did this process enter current queue?
+   - Timestamp for calculating age in queue
+   - Useful for starvation detection
+   - Week 3: Used for priority boost decisions
+
+---
+
+### 4. System Call Implementation
+
+#### 4a. Syscall Number Definition (kernel/syscall.h)
+
+```c
+#define SYS_getprocinfo 22
+```
+
+**Why 22?** 
+- xv6 already has syscalls 1-21
+- We add our new syscall as number 22
+- This maps to syscall dispatcher array in syscall.c
+
+---
+
+#### 4b. Syscall Dispatcher Setup (kernel/syscall.c)
+
+**Added the prototype:**
+```c
+extern uint64 sys_getprocinfo(void);
+```
+
+This declares that the function exists and will be implemented elsewhere (sysproc.c).
+
+**Added to dispatcher array:**
+```c
+static uint64 (*syscalls[])(void) = {
+  // ... existing syscalls ...
+  [SYS_getprocinfo] sys_getprocinfo,
+};
+```
+
+**How it works:**
+1. User calls `getprocinfo(&info)` in user-space
+2. RISC-V `ecall` instruction triggers syscall handler
+3. syscall() function in syscall.c extracts syscall number (22)
+4. Looks up `syscalls[22]` in array
+5. Calls `sys_getprocinfo()` function
+6. Result returned to user
+
+---
+
+#### 4c. Syscall Implementation (kernel/sysproc.c)
+
+```c
+uint64
+sys_getprocinfo(void)
+{
+  uint64 addr;                    // Address in user space where to copy data
+  struct proc *p = myproc();      // Get current process structure
+  struct procinfo info;           // Local copy of process info
+
+  argaddr(0, &addr);              // Extract first syscall argument (pointer to procinfo)
+
+  // Fill the procinfo structure with current process information
+  info.pid = p->pid;                              // Process ID
+  info.state = p->state;                          // Process state
+  info.queue_level = p->queue_level;              // Current MLFQ level
+  info.time_in_queue = p->time_in_queue;          // Time in current queue
+  info.time_slices = p->time_slices;              // Total CPU time
+  safestrcpy(info.name, p->name, sizeof(info.name));  // Process name
+
+  // Copy the structure to user space
+  if(copyout(p->pagetable, addr, (char *)&info, sizeof(info)) < 0)
+    return -1;                    // Error: couldn't copy (bad address)
+
+  return 0;                       // Success
+}
+```
+
+**Line-by-line Explanation:**
+
+1. **`uint64 addr`**: Where in user memory should we write the data?
+
+2. **`struct proc *p = myproc()`**: Get the current process structure
+   - myproc() returns pointer to process running on this CPU
+   - Contains all process info including MLFQ fields
+
+3. **`struct procinfo info`**: Local kernel-space structure to fill
+   - We fill this in kernel space first (safe)
+   - Then copy to user space
+
+4. **`argaddr(0, &addr)`**: Extract argument from user syscall
+   - Argument 0 is the pointer user passed: `&info`
+   - This is user-space address; we can't directly access it
+   - argaddr() retrieves it safely
+
+5. **Filling the struct:**
+   - `info.pid = p->pid`: Copy process ID
+   - `info.state = p->state`: Copy state (UNUSED, RUNNABLE, RUNNING, etc.)
+   - `info.queue_level = p->queue_level`: Our new MLFQ field
+   - `info.time_in_queue = p->time_in_queue`: Our new MLFQ field
+   - `info.time_slices = p->time_slices`: Our new MLFQ field
+   - `safestrcpy(info.name, p->name, ...)`: Copy name safely
+
+6. **`copyout(p->pagetable, addr, (char *)&info, sizeof(info))`**:
+   - Copy from kernel space (info) to user space (addr)
+   - p->pagetable: User's page table for memory translation
+   - (char *)&info: Source (kernel space)
+   - addr: Destination (user space address)
+   - sizeof(info): How many bytes to copy
+   - Returns -1 if address invalid (user passed bad pointer)
+
+7. **Return values:**
+   - 0 = success
+   - -1 = error (bad user address)
+
+---
+
+### 5. User-Space Interface
+
+#### 5a. User Header (user/user.h)
+
+```c
+// MLFQ Scheduler structure (same as kernel)
+struct procinfo {
+  int pid;
+  int state;
+  int queue_level;
+  int time_in_queue;
+  uint64 time_slices;
+  char name[16];
+};
+
+// system calls
+int getprocinfo(struct procinfo*);
+```
+
+**Why duplicate the struct?**
+- User programs need to know what procinfo looks like
+- Can't include kernel headers from user programs
+- Kernel and user must agree on layout
+- Changes here must match kernel changes
+
+---
+
+#### 5b. Syscall Stub Generator (user/usys.pl)
+
+```perl
+entry("getprocinfo");
+```
+
+**What does this do?**
+- This Perl script generates RISC-V assembly for syscalls
+- Perl is executed during build process
+- Generates usys.S file with:
+
+```asm
+.global getprocinfo
+getprocinfo:
+  li a7, SYS_getprocinfo    # Load syscall number (22) into a7
+  ecall                      # Trigger syscall
+  ret                        # Return to caller
+```
+
+**How it works:**
+1. User program calls `getprocinfo(&info)` in C
+2. Compiler generates call to `getprocinfo` function
+3. `getprocinfo` assembly does:
+   - Load syscall number 22 into register a7
+   - Execute `ecall` instruction (software trap)
+   - Jump to kernel syscall handler
+   - Handler calls sys_getprocinfo()
+   - Result returned in register a0
+
+---
+
+### 6. Process Initialization
+
+#### 6a. Initialization in procinit() (kernel/proc.c)
+
+```c
+void
+procinit(void)
+{
+  struct proc *p;
+  
+  initlock(&pid_lock, "nextpid");
+  initlock(&wait_lock, "wait_lock");
+  for(p = proc; p < &proc[NPROC]; p++) {
+      initlock(&p->lock, "proc");
+      p->state = UNUSED;
+      p->kstack = KSTACK((int) (p - proc));
+      
+      // Initialize MLFQ fields
+      p->queue_level = 0;       // Start at highest priority
+      p->time_in_queue = 0;
+      p->time_slices = 0;
+      p->entered_queue_tick = 0;
+  }
+}
+```
+
+**When is this called?**
+- During kernel boot, before first user program
+- Initializes all 64 process table slots (NPROC=64)
+
+**Why?**
+- Process table is global array
+- Must be initialized before use
+- Prevents garbage values in MLFQ fields
+
+**What it does:**
+- Loops through all process slots
+- Sets all MLFQ fields to 0
+- queue_level = 0: Highest priority from start
+- time_in_queue = 0: Not in any queue yet
+- time_slices = 0: No CPU time yet
+- entered_queue_tick = 0: No timestamp yet
+
+---
+
+#### 6b. Initialization in allocproc() (kernel/proc.c)
+
+```c
+static struct proc*
+allocproc(void)
+{
+  struct proc *p;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state == UNUSED) {
+      goto found;
+    } else {
+      release(&p->lock);
+    }
+  }
+  return 0;
+
+found:
+  p->pid = allocpid();
+  p->state = USED;
+
+  // Allocate a trapframe page...
+  if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // ... setup page table ...
+
+  // Set up new context to start executing at forkret
+  memset(&p->context, 0, sizeof(p->context));
+  p->context.ra = (uint64)forkret;
+  p->context.sp = p->kstack + PGSIZE;
+
+  // Initialize MLFQ fields for new process
+  p->queue_level = 0;          // Start at highest priority queue
+  p->time_in_queue = 0;        // Reset time in current queue
+  p->time_slices = 0;          // Reset total time slices
+  p->entered_queue_tick = 0;   // Will be set when first scheduled
+
+  return p;
+}
+```
+
+**When is this called?**
+- Every time a new process is created (fork, exec, init)
+
+**What it does:**
+1. Finds an unused process slot (state == UNUSED)
+2. Allocates resources (trapframe, pagetable, stack)
+3. **Initializes MLFQ fields to 0**
+4. Returns the process structure
+
+**Why init to 0?**
+- New process starts at highest priority (level 0)
+- No time in queue yet (time_in_queue = 0)
+- No CPU time yet (time_slices = 0)
+- Not yet scheduled (entered_queue_tick = 0)
+
+---
+
+#### 6c. Cleanup in freeproc() (kernel/proc.c)
+
+```c
+static void
+freeproc(struct proc *p)
+{
+  if(p->trapframe)
+    kfree((void*)p->trapframe);
+  p->trapframe = 0;
+  if(p->pagetable)
+    proc_freepagetable(p->pagetable, p->sz);
+  p->pagetable = 0;
+  p->sz = 0;
+  p->pid = 0;
+  p->parent = 0;
+  p->name[0] = 0;
+  p->chan = 0;
+  p->killed = 0;
+  p->xstate = 0;
+  p->state = UNUSED;
+  
+  // Reset MLFQ fields
+  p->queue_level = 0;
+  p->time_in_queue = 0;
+  p->time_slices = 0;
+  p->entered_queue_tick = 0;
+}
+```
+
+**When is this called?**
+- When a process terminates and is cleaned up
+
+**Why reset MLFQ fields?**
+- Process structure returns to UNUSED state
+- Must not retain old scheduling data
+- Next process using this slot should start fresh
+- Prevents leaking data between processes
+
+---
+
+### 7. Makefile Update
+
+**Added to UPROGS list:**
+```makefile
+UPROGS=\
+	$U/_cat\
+	$U/_echo\
+	...
+	$U/_test_getprocinfo\
+	$U/_scheduler_demo\
+```
+
+**Why?**
+- UPROGS = list of all user programs to build
+- Makefile rule: `_%: %.o` compiles each program
+- These programs linked into filesystem image (fs.img)
+- Available when booting xv6
+
+**Build process:**
+1. `make clean` removes old build artifacts
+2. `make` triggers:
+   - Compile kernel
+   - Compile all UPROGS
+   - Create filesystem with programs
+   - Ready to run with `make qemu`
+
+---
+
+## Testing and Verification
+
+### Test Program 1: test_getprocinfo.c
+
+```c
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "user/user.h"
+#include "kernel/proc.h"
+
+int
+main(int argc, char *argv[])
+{
+  struct procinfo info;           // Local procinfo structure
+  
+  printf("Testing getprocinfo() syscall...\n");
+  printf("Getting info for current process (PID %d)\n", getpid());
+  
+  // Call the syscall
+  if(getprocinfo(&info) < 0) {
+    printf("getprocinfo() failed!\n");
+    exit(1);
+  }
+  
+  // Display results
+  printf("\n=== Process Information ===\n");
+  printf("PID: %d\n", info.pid);
+  printf("Process Name: %s\n", info.name);
+  printf("State: %d\n", info.state);
+  printf("Queue Level: %d\n", info.queue_level);
+  printf("Time in Queue: %d ticks\n", info.time_in_queue);
+  printf("Total Time Slices: %d\n", (int)info.time_slices);
+  printf("=========================\n");
+  
+  printf("\ngetprocinfo() syscall works correctly!\n");
+  
+  exit(0);
+}
+```
+
+**What it tests:**
+1. Calls getprocinfo() syscall
+2. Verifies it returns successfully (0)
+3. Prints all returned fields
+4. Confirms syscall is working
+
+**Expected output:**
+```
+Testing getprocinfo() syscall...
+Getting info for current process (PID 3)
+
+=== Process Information ===
+PID: 3
+Process Name: test_getprocinfo
+State: 3
+Queue Level: 0
+Time in Queue: 0 ticks
+Total Time Slices: 0
+=========================
+
+getprocinfo() syscall works correctly!
+```
+
+---
+
+### Test Program 2: scheduler_demo.c
+
+```c
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "user/user.h"
+#include "kernel/proc.h"
+
+#define NUM_CHILDREN 3
+#define CPU_WORK 10000000
+
+// CPU-intensive function - burns CPU cycles
+void
+cpu_intensive_work(int iterations)
+{
+  volatile int sum = 0;
+  for(int i = 0; i < iterations; i++) {
+    sum += i * i;
+  }
+}
+
+// I/O-bound function - yields to scheduler
+void
+io_bound_work(int iterations)
+{
+  for(int i = 0; i < iterations; i++) {
+    pause(1);  // Yield to scheduler
+  }
+}
+
+int
+main(int argc, char *argv[])
+{
+  int pid;
+  struct procinfo info;
+  int type = 0;
+  
+  if(argc > 1) {
+    type = atoi(argv[1]);
+  }
+  
+  if(type == 0) {
+    // Parent process - create mixed workload
+    printf("=== MLFQ Scheduler Demonstration ===\n");
+    printf("Starting test processes...\n\n");
+    
+    // Create CPU-bound child
+    if((pid = fork()) == 0) {
+      printf("Child 1 (CPU-bound): Started (PID %d)\n", getpid());
+      
+      for(int i = 0; i < 5; i++) {
+        if(getprocinfo(&info) >= 0) {
+          printf("  Loop %d - Queue: %d, Time in Queue: %d, Slices: %d\n",
+                 i, info.queue_level, info.time_in_queue, (int)info.time_slices);
+        }
+        cpu_intensive_work(CPU_WORK);
+      }
+      printf("Child 1 (CPU-bound): Finished\n");
+      exit(0);
+    }
+    
+    // Create I/O-bound child
+    if((pid = fork()) == 0) {
+      printf("Child 2 (I/O-bound): Started (PID %d)\n", getpid());
+      
+      for(int i = 0; i < 10; i++) {
+        if(getprocinfo(&info) >= 0) {
+          printf("  Iter %d - Queue: %d, Time in Queue: %d, Slices: %d\n",
+                 i, info.queue_level, info.time_in_queue, (int)info.time_slices);
+        }
+        io_bound_work(1);  // Single pause iteration
+      }
+      printf("Child 2 (I/O-bound): Finished\n");
+      exit(0);
+    }
+    
+    // Create mixed workload child
+    if((pid = fork()) == 0) {
+      printf("Child 3 (Mixed): Started (PID %d)\n", getpid());
+      
+      for(int i = 0; i < 7; i++) {
+        if(getprocinfo(&info) >= 0) {
+          printf("  Iter %d - Queue: %d, Time in Queue: %d, Slices: %d\n",
+                 i, info.queue_level, info.time_in_queue, (int)info.time_slices);
+        }
+        if(i % 2 == 0) {
+          cpu_intensive_work(CPU_WORK / 2);
+        } else {
+          io_bound_work(1);
+        }
+      }
+      printf("Child 3 (Mixed): Finished\n");
+      exit(0);
+    }
+    
+    printf("Parent process (PID %d) monitoring...\n", getpid());
+    printf("Waiting for children to complete...\n\n");
+    
+    // Wait for all children
+    for(int i = 0; i < 3; i++) {
+      wait(0);
+    }
+    
+    printf("\n=== Test Complete ===\n");
+    printf("Expected behavior:\n");
+    printf("- CPU-bound child should move to lower priority queues\n");
+    printf("- I/O-bound child should remain at high priority\n");
+    printf("- Mixed child should oscillate in priority\n");
+    
+  } else {
+    // Direct test mode
+    printf("getprocinfo() Test - Process %d:\n", getpid());
+    
+    for(int i = 0; i < 10; i++) {
+      if(getprocinfo(&info) >= 0) {
+        printf("Sample %d: PID=%d, Queue=%d, TimeInQ=%d, Slices=%d\n",
+               i, info.pid, info.queue_level, info.time_in_queue, (int)info.time_slices);
+      }
+      pause(1);
+    }
+  }
+  
+  exit(0);
+}
+```
+
+**What it demonstrates:**
+
+1. **CPU-Bound Child:**
+   - Loops 5 times
+   - Each iteration: print stats, do heavy computation
+   - After Week 2: Would see queue_level increase
+   - Pattern expected: 0 → 1 → 2 → 3
+
+2. **I/O-Bound Child:**
+   - Loops 10 times
+   - Each iteration: print stats, yield (pause)
+   - After Week 2: Would stay at queue_level 0
+   - Pattern expected: 0 → 0 → 0 → 0...
+
+3. **Mixed Child:**
+   - Loops 7 times
+   - Alternates: compute, yield, compute, yield...
+   - After Week 2: Would oscillate
+   - Pattern expected: 0 → 1 → 0 → 1 → 0...
+
+**Current behavior (Week 1):**
+- All queue_level = 0 (no demotion yet)
+- All time_in_queue = 0 (not tracking yet)
+- All time_slices = 0 (scheduler hasn't run yet)
+
+**Why important for testing:**
+- Shows expected MLFQ behavior patterns
+- Foundation for Week 2 testing
+- Demonstrates three process types
+
+---
+
+## Key Design Decisions
+
+### 1. Why 4 Queues?
+
+**Options considered:**
+- 2 queues: Too coarse (can't differentiate process types well)
+- 4 queues: Good balance (what we chose)
+- 8 queues: Too fine (complex, hard to tune)
+
+**Why 4?**
+- Proven in academic research (Unix 4.3BSD)
+- Enough levels to classify: interactive → mixed → CPU-bound → batch
+- Not too many: simpler to implement and debug
+- Easy to remember: 0, 1, 2, 3
+
+---
+
+### 2. Why These Time Quanta (2, 4, 8, 16)?
+
+**Options considered:**
+- Linear (1, 2, 3, 4): Doesn't differentiate well
+- Exponential (2, 4, 8, 16): What we chose
+- Other exponential (1, 2, 4, 8): Also valid
+
+**Why exponential?**
+- Each level gets 2x more time than previous
+- Naturally prevents starvation
+- Lower levels still get CPU time
+- Mathematical property: sum doesn't grow unboundedly
+
+**Why start at 2 (not 1)?**
+- 1 tick is too small (too many context switches)
+- 2 ticks gives enough work before checking quantum
+- Reduces overhead
+- Still responsive for interactive processes
+
+---
+
+### 3. Why Priority Boost Every 100 Ticks?
+
+**Options considered:**
+- Every 50 ticks: Too frequent, defeats demotion purpose
+- Every 100 ticks: What we chose
+- Every 200 ticks: Risk of starvation
+
+**Why 100?**
+- Allows ~12 demotions (100 ÷ 8 ≈ 12)
+- Time for behavior classification
+- Not so long that starving processes wait forever
+- Empirically chosen (can be tuned based on workload)
+
+---
+
+### 4. Why Store time_slices But Not Used Yet?
+
+**Purposes of time_slices:**
+- Metrics: Total CPU time per process
+- Debug: Understand process behavior
+- Week 3: Could use for fairness calculations
+- Not used for scheduling decisions in MLFQ
+
+**Why include it?**
+- Good practice for debugging
+- Foundation for future enhancements
+- Users can see total CPU consumption
+
+---
+
+### 5. Why separate queue_level, time_in_queue, entered_queue_tick?
+
+**Could we use fewer fields?**
+
+```c
+// Option A: Only queue_level (insufficient)
+int queue_level;  // Which queue?
+// Problems: Can't track time, can't detect starvation
+
+// Option B: Only queue_level + time_in_queue (almost works)
+int queue_level;      // Which queue?
+int time_in_queue;    // How long in this queue?
+// Problems: Can't detect starvation, no boost calculation
+
+// Option C: What we chose (complete)
+int queue_level;          // Which queue?
+int time_in_queue;        // How long in this queue?
+int entered_queue_tick;   // When entered? (for starvation detection)
+```
+
+**Why our choice is best:**
+- Supports demotion logic
+- Enables starvation detection
+- Allows priority boost calculation
+- Foundation for all three weeks
+
+---
+
+## Week 1 vs Future Weeks
+
+### What We Did (Week 1 - Done ✅)
+
+```c
+// We implemented:
+struct procinfo {...}           // Data structure ✅
+struct proc { int queue_level; ... }  // Fields ✅
+sys_getprocinfo()              // Syscall ✅
+procinit()                      // Initialization ✅
+allocproc()                     // Initialization ✅
+freeproc()                      // Cleanup ✅
+```
+
+### What We'll Do (Week 2 - Next)
+
+```c
+// We'll add:
+struct runqueue {              // Queue management
+  struct proc *head;
+  struct proc *tail;
+};
+
+// Modify scheduler():
+void scheduler() {
+  // Check queue 0 first
+  // Check queue 1 if 0 empty
+  // Check queue 2 if 1 empty
+  // Check queue 3 if 2 empty
+  
+  // Run process for its quantum
+  // When quantum expires: demote
+}
+
+// In timer interrupt:
+if (time_since_boost > 100) {
+  // Move all processes to queue 0
+}
+```
+
+### What We'll Do (Week 3 - After Week 2)
+
+```c
+// Implement:
+- Priority boost logic
+- boostproc() syscall (optional)
+- Comprehensive testing
+- Performance analysis
+```
+
+---
+
+## Summary of Week 1 Code Changes
+
+### Files Modified: 7
+
+| File | Change | Lines |
+|------|--------|-------|
+| kernel/proc.h | Added MLFQ constants, structures, fields | ~15 |
+| kernel/proc.c | Initialize MLFQ fields in 3 functions | ~12 |
+| kernel/syscall.h | Added SYS_getprocinfo | 1 |
+| kernel/syscall.c | Added prototype and dispatcher | 2 |
+| kernel/sysproc.c | Implemented sys_getprocinfo() | ~20 |
+| user/user.h | Added procinfo struct and declaration | ~10 |
+| user/usys.pl | Added syscall stub | 1 |
+
+### Files Created: 8
+
+| File | Type | Lines |
+|------|------|-------|
+| user/test_getprocinfo.c | Test program | 45 |
+| user/scheduler_demo.c | Test program | 128 |
+| MLFQ_DESIGN.md | Design doc | 400 |
+| WEEK1_SUMMARY.md | Implementation guide | 300 |
+| WEEK1_QUICK_REF.md | Quick reference | 400 |
+| WEEK1_VISUAL_OVERVIEW.md | Diagrams | 200 |
+| WEEK1_CHECKLIST.md | Verification | 200 |
+| WEEK1_COMPLETION_REPORT.md | Report | 200 |
+
+### Also Modified: 1
+
+| File | Change |
+|------|--------|
+| Makefile | Added test programs to UPROGS |
+
+---
+
+## How to Test
+
+### Quick Test
+```bash
+cd /path/to/xv6-riscv
+make clean
+make CPUS=1
+make qemu
+```
+
+In xv6 shell:
+```bash
+test_getprocinfo
+```
+
+### Full Demo
+```bash
+scheduler_demo
+```
+
+### Expected Output
+```
+getprocinfo() syscall works correctly!
+```
+
+All MLFQ fields initially 0 (before Week 2 implementation).
+
+---
+
+## Key Takeaways for Viva
+
+### What is MLFQ?
+Multi-level feedback queue - priority-based scheduler that dynamically adjusts process priorities based on behavior.
+
+### Why MLFQ?
+Better than round-robin by balancing interactivity (I/O-bound) with fairness (CPU-bound).
+
+### Our Design
+- 4 queues: 0 (highest) to 3 (lowest)
+- Quanta: 2, 4, 8, 16 ticks
+- Demotion: When using full quantum
+- Boost: Every 100 ticks
+
+### Week 1 Scope
+Foundation only: data structures, initialization, syscall interface. No actual scheduling logic yet (that's Week 2).
+
+### getprocinfo() Purpose
+User-space programs query MLFQ metrics for testing and debugging. Essential for verification.
+
+### Key Code Sections
+1. Constants/structures in proc.h
+2. Field initialization in proc.c
+3. Syscall implementation in sysproc.c
+4. User interface in user.h
+5. Test programs for validation
+
+### Ready for Week 2?
+YES - All foundation in place, no blockers, clear path to queue implementation and scheduler modification.
+
+---
+
+## Viva Question Prep
+
+**Q: What does getprocinfo() do?**
+A: It's a syscall that returns the current process's MLFQ information (PID, state, queue level, time in queue, total CPU time) to user-space programs for testing/debugging.
+
+**Q: Why 4 queues?**
+A: Proven balance between complexity and differentiation - enough to classify process types (interactive, mixed, CPU-bound, batch) without being too complex.
+
+**Q: What are the time quanta and why?**
+A: 2, 4, 8, 16 ticks (exponential) - exponential growth prevents starvation while giving higher priority levels shorter quanta for responsiveness.
+
+**Q: What's in struct proc?**
+A: queue_level (0-3), time_in_queue (ticks in current level), time_slices (total CPU time), entered_queue_tick (when entered current queue).
+
+**Q: How does the syscall work?**
+A: User calls getprocinfo(&info) → generates ecall with SYS_getprocinfo → kernel handler sys_getprocinfo() fills procinfo struct → copies to user space via copyout().
+
+**Q: What happens in Week 2?**
+A: Implement actual queue arrays, modify scheduler() to dispatch from queues, add demotion logic when quantum expires, enforce time quantum checks.
+
+**Q: What about starvation?**
+A: Priority boost every 100 ticks moves all processes to queue 0, preventing indefinite starvation of lower-priority processes.
+
+**Q: How are processes initialized?**
+A: procinit() initializes all proc table slots during boot, allocproc() initializes new processes at creation, freeproc() resets when process terminates.
+
+---
+
+**End of Viva Explanation Document**
