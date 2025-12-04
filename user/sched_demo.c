@@ -1,7 +1,6 @@
 #include "kernel/types.h"
 #include "kernel/stat.h"
 #include "user/user.h"
-#include "kernel/proc.h"
 
 #define NUM_CHILDREN 3
 #define CPU_WORK 10000000

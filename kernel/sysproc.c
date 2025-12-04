@@ -7,6 +7,11 @@
 #include "proc.h"
 #include "vm.h"
 
+// External declarations for MLFQ scheduler
+extern struct proc proc[NPROC];
+extern struct mlfq_stats scheduler_stats;
+extern struct spinlock stats_lock;
+
 uint64
 sys_exit(void)
 {

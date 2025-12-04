@@ -11,6 +11,8 @@ uint ticks;
 
 extern char trampoline[], uservec[];
 extern uint ticks_since_boost;
+extern struct spinlock stats_lock;
+extern struct mlfq_stats scheduler_stats;
 
 // in kernelvec.S, calls kerneltrap().
 void kernelvec();
@@ -189,6 +191,11 @@ clockintr()
       // Demote to next level if not already at lowest
       if(p->queue_level < MLFQ_LEVELS - 1) {
         p->queue_level++;
+        
+        // Update demotion statistics
+        acquire(&stats_lock);
+        scheduler_stats.total_demotions++;
+        release(&stats_lock);
       }
       
       // Yield to scheduler

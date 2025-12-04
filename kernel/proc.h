@@ -1,3 +1,6 @@
+#ifndef PROC_H
+#define PROC_H
+
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
@@ -139,3 +142,5 @@ struct proc {
   int entered_queue_tick;      // Tick when process entered current queue
   struct proc *queue_next;     // Next process in queue (for queue management)
 };
+
+#endif

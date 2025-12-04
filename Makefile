@@ -143,8 +143,8 @@ UPROGS=\
 	$U/_logstress\
 	$U/_forphan\
 	$U/_dorphan\
-	$U/_test_getprocinfo\
-	$U/_scheduler_demo\
+	$U/_getprocinfo\
+	$U/_sched_demo\
 	$U/_mlfq_test\
 	$U/_mlfq_stats\
 
